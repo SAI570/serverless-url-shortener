@@ -1,0 +1,223 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Serverless URL shortener with analytics and security controls
+
+Parameters:
+  EnableWAF:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: WAF is not free tier. Set true to add IP rate limiting.
+
+Conditions:
+  UseWAF: !Equals [!Ref EnableWAF, 'true']
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 5
+    MemorySize: 128
+    CodeUri: src/
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref LinksTable
+
+Resources:
+  LinksTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: code
+          AttributeType: S
+      KeySchema:
+        - AttributeName: code
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  Api:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: Prod
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          ThrottlingRateLimit: 20
+          ThrottlingBurstLimit: 40
+          LoggingLevel: ERROR
+          MetricsEnabled: true
+      Cors:
+        AllowOrigin: "'*'"
+        AllowHeaders: "'Content-Type'"
+        AllowMethods: "'GET,POST,OPTIONS'"
+
+  CreateFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: create_link.handler
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: dynamodb:PutItem
+              Resource: !GetAtt LinksTable.Arn
+      Events:
+        Create:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /links
+            Method: POST
+
+  RedirectFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: redirect.handler
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: dynamodb:UpdateItem
+              Resource: !GetAtt LinksTable.Arn
+      Events:
+        Redirect:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /{code}
+            Method: GET
+
+  StatsFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: stats.handler
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: dynamodb:GetItem
+              Resource: !GetAtt LinksTable.Arn
+      Events:
+        Stats:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /stats/{code}
+            Method: GET
+
+  # ---- Monitoring ----
+  ErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Lambda errors in the shortener
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CreateFn
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  # ---- Optional WAF (rate limit per IP) ----
+  WebACL:
+    Type: AWS::WAFv2::WebACL
+    Condition: UseWAF
+    Properties:
+      Scope: REGIONAL
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: shortener-acl
+      Rules:
+        - Name: RateLimitPerIP
+          Priority: 1
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: 300
+              AggregateKeyType: IP
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: rate-limit
+
+  WebACLAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Condition: UseWAF
+    DependsOn: ApiProdStage
+    Properties:
+      ResourceArn: !Sub arn:aws:apigateway:${AWS::Region}::/restapis/${Api}/stages/Prod
+      WebACLArn: !GetAtt WebACL.Arn
+
+  # ---- Frontend: private S3 bucket behind CloudFront (OAC) ----
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  OAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${AWS::StackName}-oac
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Origins:
+          - Id: s3
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+            OriginAccessControlId: !GetAtt OAC.Id
+        DefaultCacheBehavior:
+          TargetOriginId: s3
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub ${SiteBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}
+
+Outputs:
+  ApiUrl:
+    Value: !Sub https://${Api}.execute-api.${AWS::Region}.amazonaws.com/Prod
+  SiteUrl:
+    Value: !Sub https://${Distribution.DomainName}
+  BucketName:
+    Value: !Ref SiteBucket

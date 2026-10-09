@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shortener</title>
+<style>
+  body{font-family:system-ui,sans-serif;max-width:560px;margin:40px auto;padding:0 16px;color:#1a1a1a}
+  input,button{font-size:16px;padding:10px;border-radius:8px;border:1px solid #ccc;width:100%;box-sizing:border-box;margin-top:8px}
+  button{background:#2563eb;color:#fff;border:0;cursor:pointer}
+  .card{background:#f4f6fa;padding:12px;border-radius:8px;margin-top:16px;word-break:break-all}
+  .err{color:#b91c1c}
+</style>
+</head>
+<body>
+<h1>URL Shortener</h1>
+<input id="url" placeholder="https://example.com/very/long/link">
+<button onclick="shorten()">Shorten</button>
+<div id="out"></div>
+
+<h2>Analytics</h2>
+<input id="code" placeholder="Enter short code">
+<button onclick="stats()">Get stats</button>
+<div id="stats"></div>
+
+<script>
+const API_URL = "REPLACE_ME"; // set by deploy step
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+async function shorten() {
+  $("out").innerHTML = "";
+  try {
+    const r = await fetch(API_URL + "/links", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({url: $("url").value})});
+    const d = await r.json();
+    $("out").innerHTML = r.ok
+      ? `<div class="card"><a href="${esc(d.short_url)}" target="_blank">${esc(d.short_url)}</a><br>Code: <b>${esc(d.code)}</b></div>`
+      : `<div class="card err">${esc(d.error || "Error")}</div>`;
+  } catch (e) { $("out").innerHTML = `<div class="card err">Network error</div>`; }
+}
+
+async function stats() {
+  const r = await fetch(API_URL + "/stats/" + encodeURIComponent($("code").value.trim()));
+  const d = await r.json();
+  $("stats").innerHTML = r.ok
+    ? `<div class="card"><b>Clicks:</b> ${esc(d.clicks)}<br><b>Created:</b> ${new Date(d.created_at*1000).toLocaleString()}<br><b>Last click:</b> ${d.last_click ? new Date(d.last_click*1000).toLocaleString() : "never"}<br><b>Target:</b> ${esc(d.url)}</div>`
+    : `<div class="card err">${esc(d.error || "Error")}</div>`;
+}
+</script>
+</body>
+</html>
