@@ -1,4 +1,9 @@
-import json, os, re, secrets, string, time
+import json
+import os
+import re
+import secrets
+import string
+import time
 from urllib.parse import urlparse
 import boto3
 from botocore.exceptions import ClientError
